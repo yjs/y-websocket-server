@@ -1,4 +1,3 @@
-
 # y-websocket-server :tophat:
 > Simple backend for [y-websocket](https://github.com/yjs/y-websocket)
 
@@ -75,6 +74,25 @@ Can take the following ENV variables:
 CALLBACK_URL=http://localhost:3000/ CALLBACK_OBJECTS='{"prosemirror":"XmlFragment"}' npm start
 ```
 This sends a debounced callback to `localhost:3000` 2 seconds after receiving an update (default `DEBOUNCE_WAIT`) with the data of an XmlFragment named `"prosemirror"` in the body.
+
+### Websocket Server with Authentication
+
+The server supports authentication via AWS AppSync to check user permissions for deliverables using JWT tokens.
+
+**Environment Variables:**
+* `APPSYNC_ENDPOINT` : AWS AppSync GraphQL endpoint URL
+
+**Client Connection:**
+```js
+// Connect with authentication parameters
+const wsProvider = new WebsocketProvider(
+  'ws://your-url?deliverableId=123&JWT=your-jwt-token-here', 
+  'my-roomname', 
+  doc
+)
+```
+
+The server will verify that the user has `DELIVERABLE_READ` permission before allowing the WebSocket connection.
 
 ## License
 
