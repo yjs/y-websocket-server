@@ -1,15 +1,19 @@
 import * as Y from 'yjs'
-import * as syncProtocol from '@y/protocols/sync'
-import * as awarenessProtocol from '@y/protocols/awareness'
+import * as syncProtocol from 'y-protocols/sync'
+import * as awarenessProtocol from 'y-protocols/awareness'
 
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import * as map from 'lib0/map'
 
 import * as eventloop from 'lib0/eventloop'
+import { LeveldbPersistence } from 'y-leveldb'
+
+import { memoryUsage } from 'node:process';
 
 import { callbackHandler, isCallbackSet } from './callback.js'
 
+const verbose = process.env.VERBOSE === 'true' || process.env.VERBOSE === '1'
 const CALLBACK_DEBOUNCE_WAIT = parseInt(process.env.CALLBACK_DEBOUNCE_WAIT || '2000')
 const CALLBACK_DEBOUNCE_MAXWAIT = parseInt(process.env.CALLBACK_DEBOUNCE_MAXWAIT || '10000')
 
@@ -20,13 +24,61 @@ const wsReadyStateOpen = 1
 const wsReadyStateClosing = 2 // eslint-disable-line
 const wsReadyStateClosed = 3 // eslint-disable-line
 
+/**
+* Log message to console with timestamp when verbose mode is enabled
+ * @param {string} msg
+ */
+const log = (msg) => {
+  if (verbose) {
+    console.log(`${new Date().toLocaleTimeString()} ${msg}`)
+  }
+}
+
+const reportMemory = () => {
+  const mem = memoryUsage()
+  return `Total Memory: ${Math.round(mem.rss / 1024 / 1024)} MB; ` + 
+    `Heap: ${Math.round(mem.heapUsed / 1024 / 1024)} MB of ${Math.round(mem.heapTotal / 1024 / 1024)} MB; ` +
+    `External: ${Math.round(mem.external / 1024 / 1024)} MB. `      // C++ objects
+}
+
+log(`Initial memory use: ${reportMemory()}`)
+
 // disable gc when using snapshots!
 const gcEnabled = process.env.GC !== 'false' && process.env.GC !== '0'
-// const persistenceDir = process.env.YPERSISTENCE
+const persistenceDir = process.env.YPERSISTENCE
 /**
  * @type {{bindState: function(string,WSSharedDoc):void, writeState:function(string,WSSharedDoc):Promise<any>, provider: any}|null}
  */
 let persistence = null
+if (typeof persistenceDir === 'string') {
+  console.info('Persisting documents to "' + persistenceDir + '"')
+  // @ts-ignore
+  const ldb = new LeveldbPersistence(persistenceDir)
+  persistence = {
+    provider: ldb,
+    bindState: async (docName, ydoc) => {
+      const persistedYdoc = await ldb.getYDoc(docName)
+      const newUpdates = Y.encodeStateAsUpdate(ydoc)
+      ldb.storeUpdate(docName, newUpdates)
+
+      // Apply persisted state to our doc
+      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedYdoc))
+
+      // Destroy the temporary Y.Doc to prevent memory leak
+      persistedYdoc.destroy()
+
+      // Store the update handler so we can remove it later
+      const persistenceUpdateHandler = update => {
+        ldb.storeUpdate(docName, update)
+      }
+      ydoc._persistenceUpdateHandler = persistenceUpdateHandler
+      ydoc.on('update', persistenceUpdateHandler)
+    },
+    writeState: async (_docName, _ydoc) => { }
+  }
+} else {
+  console.info('No persistence database configured.')
+}
 
 /**
  * @param {{bindState: function(string,WSSharedDoc):void,
@@ -84,7 +136,7 @@ export class WSSharedDoc extends Y.Doc {
   /**
    * @param {string} name
    */
-  constructor (name) {
+  constructor(name) {
     super({ gc: gcEnabled })
     this.name = name
     /**
@@ -119,14 +171,58 @@ export class WSSharedDoc extends Y.Doc {
         send(this, c, buff)
       })
     }
-    this.awareness.on('update', awarenessChangeHandler)
-    this.on('update', /** @type {any} */ (updateHandler))
+    // Store handler references for cleanup
+    this._awarenessChangeHandler = awarenessChangeHandler
+    this._updateHandler = /** @type {any} */(updateHandler)
+
+    this.awareness.on('update', this._awarenessChangeHandler)
+    this.on('update', this._updateHandler)
     if (isCallbackSet) {
-      this.on('update', (_update, _origin, doc) => {
-        debouncer(() => callbackHandler(/** @type {WSSharedDoc} */ (doc)))
-      })
+      this._callbackUpdateHandler = (_update, _origin, doc) => {
+        // Use weak reference to avoid holding document in closure
+        const docName = doc.name
+        debouncer(() => {
+          const currentDoc = docs.get(docName)
+          if (currentDoc) {
+            callbackHandler(currentDoc)
+          }
+        })
+      }
+      this.on('update', this._callbackUpdateHandler)
     }
     this.whenInitialized = contentInitializor(this)
+  }
+
+  /**
+   * Cleanup all event handlers and destroy document
+   */
+  cleanup() {
+    // Remove event handlers
+    if (this._awarenessChangeHandler) {
+      this.awareness.off('update', this._awarenessChangeHandler)
+      this._awarenessChangeHandler = null
+    }
+    if (this._updateHandler) {
+      this.off('update', this._updateHandler)
+      this._updateHandler = null
+    }
+    if (this._callbackUpdateHandler) {
+      this.off('update', this._callbackUpdateHandler)
+      this._callbackUpdateHandler = null
+    }
+    if (this._persistenceUpdateHandler) {
+      this.off('update', this._persistenceUpdateHandler)
+      this._persistenceUpdateHandler = null
+    }
+
+    // Clear awareness states
+    this.awareness.destroy()
+
+    // Clear connections map
+    this.conns.clear()
+
+    // Destroy the document
+    this.destroy()
   }
 }
 
@@ -137,23 +233,31 @@ export class WSSharedDoc extends Y.Doc {
  * @param {boolean} gc - whether to allow gc on the doc (applies only when created)
  * @return {WSSharedDoc}
  */
-export const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => {
-  const doc = new WSSharedDoc(docname)
-  doc.gc = gc
-  if (persistence !== null) {
-    persistence.bindState(docname, doc)
-  }
-  docs.set(docname, doc)
-  return doc
-})
+export const getYDoc = (docname, gc = true) => {
+  return map.setIfUndefined(docs, docname, () => {
+    const doc = new WSSharedDoc(docname)
+    doc.gc = gc
+    if (persistence !== null) {
+      // Store the persistence promise so clients can wait for initialization
+      doc.whenInitialized = persistence.bindState(docname, doc)
+    }
+    docs.set(docname, doc)
+    return doc
+  })
+}
 
 /**
  * @param {any} conn
  * @param {WSSharedDoc} doc
  * @param {Uint8Array} message
  */
-const messageListener = (conn, doc, message) => {
+const messageListener = async (conn, doc, message) => {
   try {
+    // Ensure persistence has loaded before processing sync messages
+    if (doc.whenInitialized) {
+      await doc.whenInitialized
+    }
+
     const encoder = encoding.createEncoder()
     const decoder = decoding.createDecoder(message)
     const messageType = decoding.readVarUint(decoder)
@@ -182,6 +286,38 @@ const messageListener = (conn, doc, message) => {
 }
 
 /**
+ * Destroy a document and clean up all references
+ * @param {string} docname
+ * @param {WSSharedDoc} doc
+ */
+const destroyDocument = (docname, doc) => {
+  if (persistence !== null) {
+    persistence.writeState(docname, doc)
+      .then(() => {
+        log(`Document state saved for ${docname}`)
+      })
+      .catch(err => {
+        console.error('Error writing state for', docname, err)
+      })
+      .finally(() => {
+        doc.cleanup()
+        docs.delete(docname)
+        if (docs.size === 0) {
+          log('No remaining documents in memory.')
+          log(`${reportMemory()}`)
+        }
+      })
+  } else {
+    doc.cleanup()
+    docs.delete(docname)
+    if (docs.size === 0) {
+      log('No remaining documents in memory.')
+      log(`${reportMemory()}`)
+    }
+  }
+}
+
+/**
  * @param {WSSharedDoc} doc
  * @param {any} conn
  */
@@ -194,12 +330,10 @@ const closeConn = (doc, conn) => {
     const controlledIds = doc.conns.get(conn)
     doc.conns.delete(conn)
     awarenessProtocol.removeAwarenessStates(doc.awareness, Array.from(controlledIds), null)
-    if (doc.conns.size === 0 && persistence !== null) {
-      // if persisted, we store state and destroy ydocument
-      persistence.writeState(doc.name, doc).then(() => {
-        doc.destroy()
-      })
-      docs.delete(doc.name)
+    if (doc.conns.size === 0) {
+      log(`All connections closed for document "${doc.name}". Destroying document.`)
+      log(`${docs.size} documents remaining. ${reportMemory()}`)
+      destroyDocument(doc.name, doc)
     }
   }
   conn.close()
@@ -233,8 +367,12 @@ export const setupWSConnection = (conn, req, { docName = (req.url || '').slice(1
   // get doc, initialize if it does not exist yet
   const doc = getYDoc(docName, gc)
   doc.conns.set(conn, new Set())
-  // listen and reply to events
-  conn.on('message', /** @param {ArrayBuffer} message */ message => messageListener(conn, doc, new Uint8Array(message)))
+  log(`Connection opened. There are ${doc.conns.size} connections for document "${doc.name}". ${reportMemory()}`)
+  // Message handler - store reference for cleanup
+  const messageHandler = /** @param {ArrayBuffer} message */ (message) => {
+    messageListener(conn, doc, new Uint8Array(message))
+  }
+  conn.on('message', messageHandler)
 
   // Check if connection is still alive
   let pongReceived = true
@@ -254,13 +392,20 @@ export const setupWSConnection = (conn, req, { docName = (req.url || '').slice(1
       }
     }
   }, pingTimeout)
-  conn.on('close', () => {
+
+  // Close handler
+  const closeHandler = () => {
     closeConn(doc, conn)
     clearInterval(pingInterval)
-  })
-  conn.on('pong', () => {
+  }
+  conn.on('close', closeHandler)
+
+  // Pong handler
+  const pongHandler = () => {
     pongReceived = true
-  })
+  }
+  conn.on('pong', pongHandler)
+
   // put the following in a variables in a block so the interval handlers don't keep in in
   // scope
   {
@@ -278,3 +423,4 @@ export const setupWSConnection = (conn, req, { docName = (req.url || '').slice(1
     }
   }
 }
+
