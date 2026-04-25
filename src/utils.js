@@ -4,7 +4,6 @@ import * as awarenessProtocol from '@y/protocols/awareness'
 
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import * as map from 'lib0/map'
 
 import * as eventloop from 'lib0/eventloop'
 
@@ -136,15 +135,19 @@ export class WSSharedDoc extends Y.Doc {
  * @param {boolean} gc - whether to allow gc on the doc (applies only when created)
  * @return {WSSharedDoc}
  */
-export const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => {
+export const getYDoc = async (docname, gc = true) => {
+  const existing = docs.get(docname)
+  if (existing) {
+    return existing
+  }
   const doc = new WSSharedDoc(docname)
   doc.gc = gc
   if (persistence !== null) {
-    persistence.bindState(docname, doc)
+    await persistence.bindState(docname, doc)
   }
   docs.set(docname, doc)
   return doc
-})
+}
 
 /**
  * @param {any} conn
@@ -227,10 +230,10 @@ const pingTimeout = 30000
  * @param {import('http').IncomingMessage} req
  * @param {any} opts
  */
-export const setupWSConnection = (conn, req, { docName = (req.url || '').slice(1).split('?')[0], gc = true } = {}) => {
+export const setupWSConnection = async (conn, req, { docName = (req.url || '').slice(1).split('?')[0], gc = true } = {}) => {
   conn.binaryType = 'arraybuffer'
   // get doc, initialize if it does not exist yet
-  const doc = getYDoc(docName, gc)
+  const doc = await getYDoc(docName, gc)
   doc.conns.set(conn, new Set())
   // listen and reply to events
   conn.on('message', /** @param {ArrayBuffer} message */ message => messageListener(conn, doc, new Uint8Array(message)))
